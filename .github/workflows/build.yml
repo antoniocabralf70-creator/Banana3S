@@ -1,0 +1,449 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Criar projeto banana3S
+        run: |
+          mkdir -p proj && cd proj
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_B3S'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.banana3s.app"
+              compileSdk = 34
+              ndkVersion = "26.1.10909125"
+              defaultConfig {
+                  applicationId = "com.banana3s.app"
+                  minSdk = 29            // Android 10+
+                  targetSdk = 34
+                  versionCode = 1; versionName = "0.1"
+                  ndk { abiFilters += listOf("arm64-v8a") }
+                  externalNativeBuild { cmake { arguments += listOf("-DANDROID_STL=c++_shared") } }
+              }
+              externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("androidx.documentfile:documentfile:1.0.1")
+          }
+          EOF_B3S
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_B3S'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="banana3S" android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher" android:theme="@style/Theme.Banana">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <activity android:name=".EmulatorActivity" android:screenOrientation="sensorLandscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden"/>
+              </application>
+          </manifest>
+          EOF_B3S
+          mkdir -p app/src/main/cpp
+          cat > app/src/main/cpp/CMakeLists.txt <<'EOF_B3S'
+          cmake_minimum_required(VERSION 3.22)
+          project(banana3s)
+          add_library(banana3s SHARED native-lib.cpp)
+          find_library(log-lib log)
+          find_library(android-lib android)
+          target_link_libraries(banana3s ${log-lib} ${android-lib})
+          # Núcleo: adicione o fork como submódulo em app/src/main/cpp/core
+          #   git submodule add https://github.com/Lime3DS/Lime3DS core
+          # e então: add_subdirectory(core) + link do alvo "core" acima.
+          EOF_B3S
+          mkdir -p app/src/main/cpp
+          cat > app/src/main/cpp/native-lib.cpp <<'EOF_B3S'
+          #include <jni.h>
+          #include <android/native_window_jni.h>
+          static ANativeWindow* g_win = nullptr;
+          // TODO: trocar estes stubs por chamadas ao núcleo (Core::System::Load / RunLoop).
+          extern "C" {
+          JNIEXPORT jboolean JNICALL Java_com_banana3s_app_NativeLibrary_load(JNIEnv* e, jobject, jstring p) { return JNI_FALSE; }
+          JNIEXPORT void JNICALL Java_com_banana3s_app_NativeLibrary_setSurface(JNIEnv* e, jobject, jobject s) {
+              if (g_win) { ANativeWindow_release(g_win); g_win = nullptr; }
+              if (s) g_win = ANativeWindow_fromSurface(e, s);
+          }
+          JNIEXPORT void JNICALL Java_com_banana3s_app_NativeLibrary_run(JNIEnv*, jobject) {}
+          JNIEXPORT void JNICALL Java_com_banana3s_app_NativeLibrary_pause(JNIEnv*, jobject) {}
+          JNIEXPORT void JNICALL Java_com_banana3s_app_NativeLibrary_stop(JNIEnv*, jobject) {}
+          }
+          EOF_B3S
+          mkdir -p app/src/main/java/com/banana3s/app
+          cat > app/src/main/java/com/banana3s/app/EmulatorActivity.kt <<'EOF_B3S'
+          package com.banana3s.app
+          import android.os.Bundle
+          import android.view.SurfaceHolder
+          import android.view.SurfaceView
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+
+          class EmulatorActivity : ComponentActivity(), SurfaceHolder.Callback {
+              private var started = false
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val sv = SurfaceView(this); sv.holder.addCallback(this); setContentView(sv)
+              }
+              override fun surfaceCreated(h: SurfaceHolder) {
+                  NativeLibrary.setSurface(h.surface)
+                  if (started) return
+                  val uri = intent.data ?: return finish()
+                  // O núcleo recebe o arquivo via descritor (funciona com SAF no Android 10+)
+                  val fd = contentResolver.openFileDescriptor(uri, "r")?.detachFd() ?: return finish()
+                  if (NativeLibrary.load("/proc/self/fd/$fd")) { started = true; Thread { NativeLibrary.run() }.start() }
+                  else { Toast.makeText(this, "Núcleo ainda não conectado", Toast.LENGTH_LONG).show(); finish() }
+              }
+              override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, hh: Int) {}
+              override fun surfaceDestroyed(h: SurfaceHolder) = NativeLibrary.setSurface(null)
+              override fun onPause() { super.onPause(); NativeLibrary.pause() }
+              override fun onDestroy() { super.onDestroy(); NativeLibrary.stop() }
+          }
+          EOF_B3S
+          mkdir -p app/src/main/java/com/banana3s/app
+          cat > app/src/main/java/com/banana3s/app/Game.kt <<'EOF_B3S'
+          package com.banana3s.app
+          import android.net.Uri
+          data class Game(val name: String, val uri: Uri, val ext: String)
+          EOF_B3S
+          mkdir -p app/src/main/java/com/banana3s/app
+          cat > app/src/main/java/com/banana3s/app/GameScanner.kt <<'EOF_B3S'
+          package com.banana3s.app
+          import android.content.Context
+          import android.net.Uri
+          import androidx.documentfile.provider.DocumentFile
+
+          object GameScanner {
+              // ROMs e homebrews aceitos
+              val EXTS = setOf("3ds", "cci", "cia", "cxi", "3dsx", "app")
+
+              fun scan(ctx: Context, tree: Uri): List<Game> {
+                  val root = DocumentFile.fromTreeUri(ctx, tree) ?: return emptyList()
+                  val out = mutableListOf<Game>()
+                  fun walk(d: DocumentFile) {
+                      for (f in d.listFiles()) {
+                          if (f.isDirectory) walk(f)
+                          else {
+                              val n = f.name ?: continue
+                              val e = n.substringAfterLast('.', "").lowercase()
+                              if (e in EXTS) out += Game(n.substringBeforeLast('.'), f.uri, e)
+                          }
+                      }
+                  }
+                  walk(root)
+                  return out.sortedBy { it.name.lowercase() }
+              }
+          }
+          EOF_B3S
+          mkdir -p app/src/main/java/com/banana3s/app
+          cat > app/src/main/java/com/banana3s/app/MainActivity.kt <<'EOF_B3S'
+          package com.banana3s.app
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.Image
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.FilterQuality
+          import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.compose.ui.graphics.luminance
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.dp
+          import androidx.documentfile.provider.DocumentFile
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences("b3s", MODE_PRIVATE)
+                  setContent {
+                      var games by remember { mutableStateOf(listOf<Game>()) }
+                      var selected by remember { mutableStateOf<Game?>(null) }
+                      val selInfo by produceState<SmdhReader.Info?>(null, selected) {
+                          val s = selected
+                          value = if (s == null) null else withContext(Dispatchers.IO) { SmdhReader.read(this@MainActivity, s.uri, s.ext) }
+                      }
+                      // O tema segue a cor do ícone do jogo selecionado
+                      val accent = selInfo?.let { Color(it.color) } ?: Color(0xFFFFC800)
+                      MaterialTheme(colorScheme = lightColorScheme(primary = accent,
+                          onPrimary = if (accent.luminance() > 0.5f) Color.Black else Color.White)) {
+                          fun rescan() {
+                              val s = prefs.getString("folder", null) ?: return
+                              games = GameScanner.scan(this, Uri.parse(s))
+                          }
+                          LaunchedEffect(Unit) { rescan() }
+                          val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+                              if (uri != null) {
+                                  contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                  prefs.edit().putString("folder", uri.toString()).apply(); rescan()
+                              }
+                          }
+                          val one = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                              if (uri != null) {
+                                  contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                  val n = DocumentFile.fromSingleUri(this, uri)?.name ?: "jogo"
+                                  selected = Game(n.substringBeforeLast('.'), uri, n.substringAfterLast('.', "").lowercase())
+                              }
+                          }
+                          Scaffold(topBar = { TopAppBar(title = { Text("🍌 banana3S") },
+                              colors = TopAppBarDefaults.topAppBarColors(containerColor = accent,
+                                  titleContentColor = if (accent.luminance() > 0.5f) Color.Black else Color.White)) }) { pad ->
+                              Column(Modifier.padding(pad).padding(16.dp)) {
+                                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                      Button(onClick = { pick.launch(null) }) { Text("Pasta de jogos") }
+                                      OutlinedButton(onClick = { one.launch(arrayOf("*/*")) }) { Text("Abrir arquivo") }
+                                  }
+                                  Spacer(Modifier.height(12.dp))
+                                  if (games.isEmpty()) Text("Escolha a pasta com seus .3ds, .cia, .cci, .cxi ou .3dsx.")
+                                  LazyColumn {
+                                      items(games) { g ->
+                                          val info by produceState<SmdhReader.Info?>(null, g.uri) {
+                                              value = withContext(Dispatchers.IO) { SmdhReader.read(this@MainActivity, g.uri, g.ext) }
+                                          }
+                                          ListItem(
+                                              leadingContent = { GameIcon(info, 56) },
+                                              headlineContent = { Text(info?.title?.ifBlank { null } ?: g.name) },
+                                              supportingContent = { Text(info?.publisher?.ifBlank { null } ?: g.ext.uppercase()) },
+                                              modifier = Modifier.clickable { selected = g })
+                                          HorizontalDivider()
+                                      }
+                                  }
+                              }
+                          }
+                          selected?.let { g ->
+                              val bg = selInfo?.let { Color(it.color).copy(alpha = 0.25f).compositeOver(Color.White) } ?: Color.White
+                              AlertDialog(
+                                  onDismissRequest = { selected = null },
+                                  containerColor = bg,
+                                  text = {
+                                      Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                                          GameIcon(selInfo, 144)
+                                          Spacer(Modifier.height(12.dp))
+                                          Text(selInfo?.title?.ifBlank { null } ?: g.name, style = MaterialTheme.typography.titleLarge)
+                                          selInfo?.publisher?.takeIf { it.isNotBlank() }?.let { Text(it) }
+                                      }
+                                  },
+                                  confirmButton = {
+                                      Button(onClick = {
+                                          startActivity(Intent(this@MainActivity, EmulatorActivity::class.java).setData(g.uri))
+                                          selected = null
+                                      }) { Text("Jogar") }
+                                  },
+                                  dismissButton = { TextButton(onClick = { selected = null }) { Text("Cancelar") } })
+                          }
+                      }
+                  }
+              }
+          }
+
+          private fun Color.compositeOver(bg: Color): Color {
+              val a = alpha
+              return Color(red * a + bg.red * (1 - a), green * a + bg.green * (1 - a), blue * a + bg.blue * (1 - a))
+          }
+
+          @Composable
+          fun GameIcon(info: SmdhReader.Info?, size: Int) {
+              val m = Modifier.size(size.dp).clip(RoundedCornerShape(12.dp))
+              if (info != null) Image(info.icon.asImageBitmap(), null, m, filterQuality = FilterQuality.None)
+              else Box(m.then(Modifier), contentAlignment = Alignment.Center) { Text("🍌") }
+          }
+          EOF_B3S
+          mkdir -p app/src/main/java/com/banana3s/app
+          cat > app/src/main/java/com/banana3s/app/NativeLibrary.kt <<'EOF_B3S'
+          package com.banana3s.app
+          import android.view.Surface
+
+          /** Ponte JNI com o núcleo (fork do Lime3DS / Azahar). */
+          object NativeLibrary {
+              init { System.loadLibrary("banana3s") }
+              external fun load(path: String): Boolean
+              external fun setSurface(surface: Surface?)
+              external fun run()
+              external fun pause()
+              external fun stop()
+          }
+          EOF_B3S
+          mkdir -p app/src/main/java/com/banana3s/app
+          cat > app/src/main/java/com/banana3s/app/SmdhReader.kt <<'EOF_B3S'
+          package com.banana3s.app
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.net.Uri
+          import java.io.FileInputStream
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+          import java.nio.channels.FileChannel
+
+          /** Lê título, desenvolvedora e ícone (SMDH) direto do arquivo do jogo. */
+          object SmdhReader {
+              data class Info(val title: String, val publisher: String, val icon: Bitmap, val color: Int)
+              private val cache = HashMap<Uri, Info?>()
+
+              fun read(ctx: Context, uri: Uri, ext: String): Info? {
+                  synchronized(cache) { if (cache.containsKey(uri)) return cache[uri] }
+                  val info = try {
+                      ctx.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                          FileInputStream(pfd.fileDescriptor).use { fis ->
+                              val ch = fis.channel
+                              val smdh = when (ext) { "3dsx" -> fromDsx(ch); "cia" -> fromCia(ch); else -> fromNcch(ch) }
+                              smdh?.let { parse(it) }
+                          }
+                      }
+                  } catch (e: Exception) { null }
+                  synchronized(cache) { cache[uri] = info }
+                  return info
+              }
+
+              private fun readAt(ch: FileChannel, off: Long, len: Int): ByteArray? {
+                  val buf = ByteBuffer.allocate(len); var pos = off
+                  while (buf.hasRemaining()) { val n = ch.read(buf, pos); if (n <= 0) return null; pos += n }
+                  return buf.array()
+              }
+              private fun u32(b: ByteArray, o: Int) = ByteBuffer.wrap(b, o, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong() and 0xFFFFFFFFL
+              private fun u16(b: ByteArray, o: Int) = ByteBuffer.wrap(b, o, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
+              private fun magic(b: ByteArray, o: Int, s: String) = String(b, o, 4, Charsets.US_ASCII) == s
+
+              private fun fromDsx(ch: FileChannel): ByteArray? {
+                  val h = readAt(ch, 0, 0x2C) ?: return null
+                  if (!magic(h, 0, "3DSX") || u16(h, 4) < 0x2C) return null
+                  val size = u32(h, 0x24).toInt()
+                  return if (size < 0x36C0) null else readAt(ch, u32(h, 0x20), size)
+              }
+
+              private fun fromCia(ch: FileChannel): ByteArray? {
+                  val h = readAt(ch, 0, 0x18) ?: return null
+                  fun a(x: Long) = (x + 63) and 63L.inv()
+                  if (u32(h, 0x14) == 0L) return null
+                  val meta = a(u32(h, 0)) + a(u32(h, 8)) + a(u32(h, 0xC)) + a(u32(h, 0x10))
+                  return readAt(ch, meta + 0x400, 0x36C0)
+              }
+
+              // .3ds/.cci/.cxi (só funciona se o jogo estiver descriptografado)
+              private fun fromNcch(ch: FileChannel): ByteArray? {
+                  val h0 = readAt(ch, 0, 0x200) ?: return null
+                  val base = if (magic(h0, 0x100, "NCSD")) u32(h0, 0x120) * 0x200 else 0L
+                  val h = if (base == 0L) h0 else readAt(ch, base, 0x200) ?: return null
+                  if (!magic(h, 0x100, "NCCH")) return null
+                  if ((h[0x18F].toInt() and 4) == 0) return null // criptografado
+                  val exefs = base + u32(h, 0x1A0) * 0x200
+                  val eh = readAt(ch, exefs, 0x200) ?: return null
+                  for (i in 0 until 10) {
+                      val name = String(eh, i * 16, 8, Charsets.US_ASCII).trimEnd('\u0000')
+                      if (name == "icon") {
+                          val off = u32(eh, i * 16 + 8); val size = u32(eh, i * 16 + 12).toInt()
+                          return if (size < 0x36C0) null else readAt(ch, exefs + 0x200 + off, size)
+                      }
+                  }
+                  return null
+              }
+
+              private fun parse(b: ByteArray): Info? {
+                  if (!magic(b, 0, "SMDH")) return null
+                  val t = 0x8 + 0x200 // inglês
+                  val title = String(b, t, 0x80, Charsets.UTF_16LE).trimEnd('\u0000')
+                  val pub = String(b, t + 0x180, 0x80, Charsets.UTF_16LE).trimEnd('\u0000')
+                  val px = IntArray(48 * 48); var r = 0L; var g = 0L; var bl = 0L
+                  for (tile in 0 until 36) for (i in 0 until 64) {
+                      val x = (i and 1) or (((i shr 2) and 1) shl 1) or (((i shr 4) and 1) shl 2)
+                      val y = ((i shr 1) and 1) or (((i shr 3) and 1) shl 1) or (((i shr 5) and 1) shl 2)
+                      val o = 0x24C0 + (tile * 64 + i) * 2
+                      val v = (b[o].toInt() and 0xFF) or ((b[o + 1].toInt() and 0xFF) shl 8)
+                      val rr = (v shr 11 and 31) * 255 / 31; val gg = (v shr 5 and 63) * 255 / 63; val bb = (v and 31) * 255 / 31
+                      px[((tile / 6) * 8 + y) * 48 + (tile % 6) * 8 + x] = (0xFF shl 24) or (rr shl 16) or (gg shl 8) or bb
+                      r += rr; g += gg; bl += bb
+                  }
+                  val n = 48 * 48
+                  val color = (0xFF shl 24) or ((r / n).toInt() shl 16) or ((g / n).toInt() shl 8) or (bl / n).toInt()
+                  return Info(title, pub, Bitmap.createBitmap(px, 48, 48, Bitmap.Config.ARGB_8888), color)
+              }
+          }
+          EOF_B3S
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_banana.xml <<'EOF_B3S'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#FFD21F" android:strokeColor="#8A5A00" android:strokeWidth="2.5"
+                  android:pathData="M28,68 Q44,92 78,62 Q92,46 84,26 L72,28 Q76,44 64,56 Q48,70 32,58 Z"/>
+              <path android:fillColor="#5B3A00" android:pathData="M84,26 L72,28 L74,22 L82,20 Z"/>
+          </vector>
+          EOF_B3S
+          mkdir -p app/src/main/res/mipmap-anydpi
+          cat > app/src/main/res/mipmap-anydpi/ic_launcher.xml <<'EOF_B3S'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/banana_bg"/>
+              <foreground android:drawable="@drawable/ic_banana"/>
+          </adaptive-icon>
+          EOF_B3S
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/colors.xml <<'EOF_B3S'
+          <resources><color name="banana_bg">#FFF3B0</color></resources>
+          EOF_B3S
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/themes.xml <<'EOF_B3S'
+          <resources><style name="Theme.Banana" parent="android:Theme.Material.Light.NoActionBar"/></resources>
+          EOF_B3S
+          cat > build.gradle.kts <<'EOF_B3S'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_B3S
+          cat > gradle.properties <<'EOF_B3S'
+          android.useAndroidX=true
+          kotlin.code.style=official
+          org.gradle.jvmargs=-Xmx3g
+          EOF_B3S
+          cat > settings.gradle.kts <<'EOF_B3S'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "banana3S"
+          include(":app")
+          EOF_B3S
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Instalar NDK e CMake
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "ndk;26.1.10909125" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Compilar APK
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: banana3S-debug-apk
+          path: proj/app/build/outputs/apk/debug/*.apk
